@@ -18,19 +18,35 @@ import (
 	"github.com/coder/websocket"
 )
 
+// MaxMessageBytes is the hard package ceiling for complete text or binary messages.
 const MaxMessageBytes = 1 << 20
+
+// MaxCloseReasonBytes is the maximum UTF-8 byte size in a close control frame.
 const MaxCloseReasonBytes = 123
 
-var (
-	ErrClosed      = errors.New("socket session is closed")
-	ErrMessageSize = errors.New("socket message exceeds configured limit")
-	ErrProtocol    = errors.New("socket protocol value is invalid")
+const (
+	maxPathBytes       = 2048
+	maxAllowedOrigins  = 256
+	maxSubprotocols    = 64
+	maxSubprotocolSize = 128
 )
 
+var (
+	// ErrClosed reports an operation on a closed WebSocket session.
+	ErrClosed = errors.New("socket session is closed")
+	// ErrMessageSize reports a message that exceeds its configured byte bound.
+	ErrMessageSize = errors.New("socket message exceeds configured limit")
+	// ErrProtocol reports an invalid socket value or configuration.
+	ErrProtocol = errors.New("socket protocol value is invalid")
+)
+
+// MessageType identifies the WebSocket data opcode exposed by Message.
 type MessageType uint8
 
 const (
+	// TextMessage marks a valid UTF-8 text frame.
 	TextMessage MessageType = iota + 1
+	// BinaryMessage marks an opaque binary frame.
 	BinaryMessage
 )
 
@@ -61,6 +77,7 @@ func (m Message) Type() MessageType { return m.typ }
 // Bytes returns a copy of the payload so callers cannot mutate the stored snapshot.
 func (m Message) Bytes() []byte { return append([]byte(nil), m.data...) }
 
+// String returns payload-safe metadata without exposing message contents.
 func (m Message) String() string {
 	kind := "unknown"
 	if m.typ == TextMessage {
@@ -118,16 +135,18 @@ type Handler func(context.Context, *Session) error
 
 // Settings bounds listener exposure and per-connection resource use.
 type Settings struct {
-	Address         string
-	Path            string
-	AllowedOrigins  []string
+	Address string
+	Path    string
+	// AllowedOrigins is a bounded list of exact HTTP(S) origins; wildcards are rejected.
+	AllowedOrigins []string
+	// Subprotocols lists unique HTTP tokens the server may negotiate, in preference order.
 	Subprotocols    []string
 	MaxConnections  int
 	MaxMessageBytes int
 }
 
-// NewSettings returns conservative listener defaults. An empty origin pattern list permits only
-// same-host origins; configure explicit patterns to permit cross-origin browser clients.
+// NewSettings returns conservative listener defaults. An empty origin list permits only
+// same-host origins; configure exact origins to permit cross-origin browser clients.
 func NewSettings() Settings {
 	return Settings{
 		Address:         "127.0.0.1:8765",
@@ -138,19 +157,48 @@ func NewSettings() Settings {
 }
 
 func (s Settings) validate() error {
-	if strings.TrimSpace(s.Address) == "" || !strings.HasPrefix(s.Path, "/") || strings.ContainsAny(s.Path, "?#") {
+	if strings.TrimSpace(s.Address) == "" || !strings.HasPrefix(s.Path, "/") || len(s.Path) > maxPathBytes || strings.ContainsAny(s.Path, "?#") || strings.IndexFunc(s.Path, func(r rune) bool { return r < 0x21 || r > 0x7e }) >= 0 {
 		return fmt.Errorf("%w: address or path is invalid", ErrProtocol)
 	}
 	if s.MaxConnections < 1 || s.MaxConnections > 65536 || s.MaxMessageBytes < 1 || s.MaxMessageBytes > MaxMessageBytes {
 		return fmt.Errorf("%w: connection or message limit is outside supported bounds", ErrProtocol)
 	}
+	if len(s.AllowedOrigins) > maxAllowedOrigins || len(s.Subprotocols) > maxSubprotocols {
+		return fmt.Errorf("%w: origin or subprotocol list exceeds its bound", ErrProtocol)
+	}
+	origins := make(map[string]struct{}, len(s.AllowedOrigins))
 	for _, origin := range s.AllowedOrigins {
 		u, err := url.Parse(origin)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" || strings.HasSuffix(u.Host, ":") || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" || strings.ContainsAny(u.Host, "*?[]") {
 			return fmt.Errorf("%w: allowed origins must be absolute HTTP(S) origins", ErrProtocol)
 		}
+		key := strings.ToLower(origin)
+		if _, duplicate := origins[key]; duplicate {
+			return fmt.Errorf("%w: allowed origins must be unique", ErrProtocol)
+		}
+		origins[key] = struct{}{}
+	}
+	protocols := make(map[string]struct{}, len(s.Subprotocols))
+	for _, protocol := range s.Subprotocols {
+		if len(protocol) == 0 || len(protocol) > maxSubprotocolSize || !isHTTPToken(protocol) {
+			return fmt.Errorf("%w: subprotocol must be a bounded HTTP token", ErrProtocol)
+		}
+		if _, duplicate := protocols[protocol]; duplicate {
+			return fmt.Errorf("%w: subprotocols must be unique", ErrProtocol)
+		}
+		protocols[protocol] = struct{}{}
 	}
 	return nil
+}
+
+func isHTTPToken(value string) bool {
+	for _, char := range []byte(value) {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(char)) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // Server provides a standalone HTTP listener with a bounded WebSocket endpoint.
@@ -162,6 +210,7 @@ type Server struct {
 	active   map[*Session]struct{}
 	server   *http.Server
 	started  bool
+	stopped  bool
 	ctx      context.Context
 	cancel   context.CancelFunc
 }
@@ -194,12 +243,20 @@ func (s *Server) Handler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			http.Error(w, "socket server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
 		select {
 		case s.slots <- struct{}{}:
 		default:
+			s.mu.Unlock()
 			http.Error(w, "socket capacity reached", http.StatusServiceUnavailable)
 			return
 		}
+		s.mu.Unlock()
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns:  s.settings.AllowedOrigins,
 			Subprotocols:    s.settings.Subprotocols,
@@ -212,6 +269,12 @@ func (s *Server) Handler() http.Handler {
 		conn.SetReadLimit(int64(s.settings.MaxMessageBytes))
 		session := &Session{conn: conn, maxBytes: s.settings.MaxMessageBytes}
 		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			_ = conn.CloseNow()
+			<-s.slots
+			return
+		}
 		s.active[session] = struct{}{}
 		s.mu.Unlock()
 		defer func() {
@@ -231,9 +294,9 @@ func (s *Server) Handler() http.Handler {
 // Serve owns listener lifecycle and blocks until Shutdown is called.
 func (s *Server) Serve(listener net.Listener) error {
 	s.mu.Lock()
-	if s.started {
+	if s.started || s.stopped {
 		s.mu.Unlock()
-		return fmt.Errorf("%w: server has already started", ErrProtocol)
+		return fmt.Errorf("%w: server is already started or has been shut down", ErrProtocol)
 	}
 	s.started = true
 	s.server = &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second}
@@ -257,18 +320,19 @@ func (s *Server) ListenAndServe() error {
 
 // Shutdown stops accepting new connections, cancels handlers, and closes active sessions.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.cancel()
-	httpServer := s.server
-	var shutdownErr error
-	if httpServer != nil {
-		shutdownErr = httpServer.Shutdown(ctx)
-	}
 	s.mu.Lock()
+	s.stopped = true
+	httpServer := s.server
 	active := make([]*Session, 0, len(s.active))
 	for session := range s.active {
 		active = append(active, session)
 	}
 	s.mu.Unlock()
+	s.cancel()
+	var shutdownErr error
+	if httpServer != nil {
+		shutdownErr = httpServer.Shutdown(ctx)
+	}
 	var closeGroup sync.WaitGroup
 	for _, session := range active {
 		closeGroup.Add(1)

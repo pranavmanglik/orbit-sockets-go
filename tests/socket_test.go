@@ -2,6 +2,7 @@ package sockets_test
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -55,6 +56,26 @@ func TestSettingsRejectUnboundedAndMalformedValues(t *testing.T) {
 	if _, err := sockets.NewServer(settings, nil); err == nil {
 		t.Fatal("expected origin path to be rejected")
 	}
+	settings = sockets.NewSettings()
+	settings.AllowedOrigins = []string{"https://*.example.com"}
+	if _, err := sockets.NewServer(settings, nil); err == nil {
+		t.Fatal("expected wildcard origin to be rejected")
+	}
+	settings = sockets.NewSettings()
+	settings.Subprotocols = []string{"orbit.v1", "orbit.v1"}
+	if _, err := sockets.NewServer(settings, nil); err == nil {
+		t.Fatal("expected duplicate subprotocol to be rejected")
+	}
+	settings = sockets.NewSettings()
+	settings.Subprotocols = []string{"invalid protocol"}
+	if _, err := sockets.NewServer(settings, nil); err == nil {
+		t.Fatal("expected invalid subprotocol token to be rejected")
+	}
+	settings = sockets.NewSettings()
+	settings.AllowedOrigins = []string{"https://example.com", "HTTPS://EXAMPLE.COM"}
+	if _, err := sockets.NewServer(settings, nil); err == nil {
+		t.Fatal("expected duplicate case-insensitive origin to be rejected")
+	}
 }
 
 func TestHandlerRoundTripAndPathValidation(t *testing.T) {
@@ -97,5 +118,30 @@ func TestHandlerRoundTripAndPathValidation(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("unexpected status %d", response.StatusCode)
+	}
+}
+
+func TestShutdownPermanentlyRejectsNewSessions(t *testing.T) {
+	server, err := sockets.NewServer(sockets.NewSettings(), func(context.Context, *sockets.Session) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ws", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("shutdown server accepted a new request: status %d", response.Code)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := server.Serve(listener); err == nil {
+		t.Fatal("shutdown server must not be restarted")
 	}
 }

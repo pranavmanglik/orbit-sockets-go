@@ -45,6 +45,11 @@ and compression are bounded or configured explicitly; compression is disabled by
 `Shutdown(ctx)` during process termination to stop accepts, cancel handlers, and close active
 sessions.
 
+`AllowedOrigins` accepts at most 256 unique `http://` or `https://` origins without paths, queries,
+fragments, credentials, or wildcard host patterns. `Subprotocols` accepts at most 64 unique HTTP
+tokens, each at most 128 bytes. Invalid paths, origins, and protocol names fail `NewServer` before
+the listener is exposed.
+
 ## Reliability and security
 
 The server bounds active sessions before upgrade and applies a read limit to complete messages.
@@ -65,7 +70,7 @@ go vet ./...
 go build ./...
 ```
 
-This package is pre-alpha. Hosted CI, Autobahn conformance, ingress integration, multi-instance
+This package is alpha. Hosted CI, Autobahn conformance, ingress integration, multi-instance
 load/soak tests, and release provenance remain open release gates.
 
 Licensed under Apache-2.0.
